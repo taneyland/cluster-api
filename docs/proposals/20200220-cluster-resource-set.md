@@ -27,9 +27,13 @@ status: experimental
         * [Story 1](#story-1)
         * [Story 2](#story-2)
         * [Story 3](#story-3)
+        * [Story 4](#story-4)
      * [Implementation Details/Notes/Constraints](#implementation-detailsnotesconstraints)
         * [Data model changes](#data-model-changes)
         * [ClusterResourceSet Object Definition](#clusterresourceset-object-definition)
+        * [ClusterResourceSetBinding Object Definition](#clusterresourcesetbinding-object-definition)
+        * [ApplyOnce mode](#applyonce-mode)
+        * [Reconcile mode](#reconcile-mode)
      * [Risks and Mitigations](#risks-and-mitigations)
   * [Alternatives](#alternatives)
   * [Upgrade Strategy](#upgrade-strategy)
@@ -59,7 +63,7 @@ To achieve this, ClusterResourceSet CRD is introduced that will be responsible f
 
 ### Goals
 
-- Provide a means to specify a set of resources to apply automatically to newly-created and existing Clusters. Resources will be applied only once.
+- Provide a means to specify a set of resources to apply automatically to newly-created and existing Clusters. Resources will be reapplied when their definition changes.
 - Support additions to the resource list by applying the new added resources to both new and existing matching clusters.
 - Provide a way to see which ClusterResourceSets are applied to a particular cluster using a new CRD, `ClusterResourceSetBinding`.
 - Support both json and yaml resources.
@@ -69,7 +73,6 @@ To achieve this, ClusterResourceSet CRD is introduced that will be responsible f
 - Replace or compete with the Cluster Addons subproject.
 - Support deletion of resources from clusters. Deleting a resource from a ClusterResourceSet or deleting a ClusterResourceSet does not result in deletion of those resources from clusters.
 - Lifecycle management of the installed resources (such as CNI).
-- Support reconciliation of resources on resource hash change and/or periodically. This can be a future enhancement work.
 
 
 ## Proposal
@@ -85,6 +88,9 @@ As someone creating multiple clusters, I want some/all my clusters to have a CNI
 As someone creating multiple clusters, I want some/all my clusters to have a StorageClass installed automatically, so I don't have to manually repeat the installation for each new cluster.
 
 #### Story 3
+As someone managing multiple clusters, I want to be able to update the CPI and CSI by just updating the the `ConfigMap`'s and `Secret`'s in the management cluster, so I don't have to manually repeat the apply for each targeted cluster.
+
+#### Story 4
 
 As someone creating multiple clusters and using ClusterResourceSet to install some resources, I want to see which resources are applied to my clusters, when they are applied, and if applied successfully.
 
@@ -121,13 +127,16 @@ spec:
      kind: ConfigMap
 ```
 
-Initially, the only supported mode will be `ApplyOnce` and it will be the default mode if no mode is provided. In the future, we may consider adding a `Reconcile` mode that reapplies the resources on resource hash change and/or periodically.
+The supported modes will be: 
+* `ApplyOnce`. This will be the default mode if no mode is provided. Resources are only applied one.
+* `Reconcile`. Resources are reapplied when the content of the `ConfigMap` or `Secret` that defines them changes.
+
 If ClusterResourceSet resources will be managed by an operator after they are applied by ClusterResourceSet controller, "ApplyOnce" mode must be used so that reconciliation on those resources can be delegated to the operator.
 
 Each item in the resources specifies a kind (must be either ConfigMap or Secret) and a name. Each referenced ConfigMap/Secret contains yaml/json content as value.
 `ClusterResourceSet` object will be added as owner to its resources.
 
-*** Secrets as Resources***
+***Secrets as Resources***
 
 Both `Secrets` and `ConfigMaps` `data` fields can be a list of key-value pairs. Any key is acceptable, and as value, there can be multiple objects in yaml or json format.
 
@@ -176,7 +185,7 @@ stringData:
      namespace: system
 ```
 
-*** ConfigMaps as Resources***
+***ConfigMaps as Resources***
 
 Similar to `Secrets`, `ConfigMaps` can be created using a yaml/json file: `kubectl create configmap calico-addon --from-file=calico1.yaml,calico2.yaml`
 Multiple keys in the data field and then multiple objects in each value are supported.
@@ -253,10 +262,86 @@ When a `ClusterResourceSet` is deleted, it will be removed from the `bindings` l
 In case of new resource addition to a `ClusterResourceSet`, that `ClusterResourceSet` will be reconciled immediately and the new resource will be applied to all matching clusters because
 the new resource does not exist in any `ClusterResourceBinding` lists.
 
+As a note, if providing different values for some fields in the resources for different clusters is needed such as CNIs podCIDRs, some templating mechanism for variable substitution in the resources can be used, but not provided by `ClusterResourceSet`.
+
+#### `ApplyOnce` mode
+
 When the same resource exist in multiple `ClusterResourceSets`, only the first one will be applied but the resource will appear as applied in all `ClusterResourceSets` in the `ClusterResourceSetsBinding/bindings`.
 Similarly, if a resource is manually created in the workload cluster, when a `ClusterResourceSet` is applied with that resource, it will not update the existing resource to avoid any overwrites but in `ClusterResourceSetBinding`, that resource will show as applied.
 
-As a note, if providing different values for some fields in the resources for different clusters is needed such as CNIs podCIDRs, some templating mechanism for variable substitution in the resources can be used, but not provided by `ClusterResourceSet`.
+#### `Reconcile` mode
+
+***Detecting changes***
+`ClusterResourceBindings` will contain consistent hash for the resource/s definitions. We will use this to detect changes, comparing the hash of the current resource/s definition with the one stored in the `ClusterResourceBindings`.
+
+Note that this hash will change when any of the resources is updated, a resource is added or a resource is removed. This means that all resources in the same `ConfigMap` or `Secret`, and not only the one that changed, will be reapplied in any of these 3 cases. It also means that resources removed from `ConfigMap` or `Secret` won't be deleted from the target clusters.
+
+In the next *before-after* example we can see that only one resource has changed (`ConfigMap` `calico-configmap`). However, all the 3 resources (`calico-secret1`, `calico-secret2` and `calico-configmap`) will be reapplied.
+
+Before:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: calico-addon
+data:
+  calico1.yaml: |-
+     kind: Secret
+     apiVersion: v1
+     metadata:
+      name: calico-secret1
+      namespace: mysecrets
+      ---
+     kind: Secret
+     apiVersion: v1
+     metadata:
+      name: calico-secret2
+      namespace: mysecrets
+  calico2.yaml: |-
+     kind: ConfigMap
+     apiVersion: v1
+     metadata:
+      name: calico-configmap
+      namespace: myconfigmaps
+     data:
+       key: "original value"
+```
+
+After:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: calico-addon
+data:
+  calico1.yaml: |-
+     kind: Secret
+     apiVersion: v1
+     metadata:
+      name: calico-secret1
+      namespace: mysecrets
+      ---
+     kind: Secret
+     apiVersion: v1
+     metadata:
+      name: calico-secret2
+      namespace: mysecrets
+  calico2.yaml: |-
+     kind: ConfigMap
+     apiVersion: v1
+     metadata:
+      name: calico-configmap
+      namespace: myconfigmaps
+     data:
+       key: "value that changed"
+```
+***Drift***
+
+The proposed solution only deals with changes in the resources' definitions and not with changes in the real objects in the workload clusters. If those objects are modified or deleted in the workload clusters, the `ClusterResourceSet`'s controller won't do anything and they will remain unchanged until their definition in the management cluster is updated.
+
+This could potentially be mitigated by:
+ * Implementing a "periodic" reconciliation mode where resources are reapplied with a certain frequency even their hash hasn't changed.
+ * Storing the compounded `Generation` of the applied objects in the `ResourceSetBinding`. Since `Generation` is a monotonically increasing integer, a change in the compounded generation (adding all the `Generation` fields for all the resources) always means at least one resource changed in the workload cluster. With this mechanism, the hash can be used to detect changes in the resources definition and the compounded generation to detect changes in the actual workload cluster's resource.
 
 ### Risks and Mitigations
 
